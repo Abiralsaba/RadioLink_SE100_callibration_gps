@@ -4,11 +4,15 @@
 //  Receives rover coordinates from Python bridge
 //  (send_rover_coordinate.py) via USB Serial at 115200.
 //
-//  Forwards them via telemetry to Side 1 (servo side)
+//  Forwards them via telemetry to Side 1 (antenna side)
 //  using Serial2 at 57600 baud.
 //
 //  Bridge format:  "lat:<value>,lon:<value>\n"
 //  Relay format:   "lat:<value>,lon:<value>\n"  (same)
+//
+//  When the bridge stops sending, the relay STOPS
+//  forwarding after 5 seconds (BRIDGE_TIMEOUT_MS).
+//  This ensures the antenna stops tracking stale data.
 //
 //  Telemetry wiring:
 //    ESP32 RX → D16
@@ -22,15 +26,19 @@
 #define TELEM_TX_PIN 17
 #define TELEM_BAUD 57600
 
+// Bridge data timeout — stop relaying after 5 seconds of no bridge input
+#define BRIDGE_TIMEOUT_MS 5000
+
 HardwareSerial telemSerial(2);
 
 // Parsed coordinates
 double rLat = 0.0;
 double rLon = 0.0;
 
-// Serial monitor & Telemetry send timers
+// Timers
 unsigned long lastPrint = 0;
 unsigned long lastTelemSend = 0;
+unsigned long lastBridgeData = 0; // When bridge last sent valid data
 
 // ═══════════════════════════════════════════════════════
 //  SETUP
@@ -52,7 +60,7 @@ void setup() {
 // ═══════════════════════════════════════════════════════
 void loop() {
 
-  // Read from USB Serial (Python bridge)
+  // --- 1. READ FROM USB SERIAL (Python bridge) ---
   while (Serial.available() > 0) {
     String line = Serial.readStringUntil('\n');
     line.trim();
@@ -85,28 +93,40 @@ void loop() {
     if (lat == 0.0 && lon == 0.0)
       continue;
 
-    // Store
+    // Store and mark as fresh
     rLat = lat;
     rLon = lon;
+    lastBridgeData = millis();
   }
 
   // --- 2. SEND TO TELEMETRY (Rate Limited to 5Hz) ---
-  // Telemetry modules (9600 baud) can get overwhelmed if we instantly forward
-  // every high-frequency ROS message. This ensures we safely send the latest.
+  // Only relay when bridge data is fresh (received within last 5 seconds).
+  // When the bridge/rover stops sending, the relay STOPS — the antenna
+  // will detect the silence and stop the motor.
   if (millis() - lastTelemSend >= 200) {
     lastTelemSend = millis();
-    String out = "lat:" + String(rLat, 7) + ",lon:" + String(rLon, 7);
-    telemSerial.println(out);
+
+    bool bridgeFresh =
+        (lastBridgeData > 0 && (millis() - lastBridgeData < BRIDGE_TIMEOUT_MS));
+
+    if (bridgeFresh) {
+      String out = "lat:" + String(rLat, 7) + ",lon:" + String(rLon, 7);
+      telemSerial.println(out);
+    }
   }
 
   // --- 3. PRINT TO PC SERIAL MONITOR ---
-  // Serial monitor — print status once per second
   if (millis() - lastPrint >= 1000) {
     lastPrint = millis();
 
+    bool bridgeFresh =
+        (lastBridgeData > 0 && (millis() - lastBridgeData < BRIDGE_TIMEOUT_MS));
+
     Serial.print("Relay: ");
-    if (rLat != 0.0 || rLon != 0.0) {
+    if (bridgeFresh) {
       Serial.printf("lat:%.7f,lon:%.7f", rLat, rLon);
+    } else if (lastBridgeData > 0) {
+      Serial.print("STALE — bridge timeout, relay stopped");
     } else {
       Serial.print("Waiting for bridge data");
     }

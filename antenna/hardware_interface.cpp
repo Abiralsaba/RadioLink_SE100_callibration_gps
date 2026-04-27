@@ -39,6 +39,9 @@
 #define MOTOR_POS_MAX 360.0
 #define MOTOR_POS_BOOT 180.0
 
+// Telemetry staleness — if no new rover data for this long, stop tracking
+#define TELEM_STALE_MS 5000
+
 // ═══════════════════════════════════════════════════════
 //  COMPASS CALIBRATION (from GPS_Compass_main.ino)
 // ═══════════════════════════════════════════════════════
@@ -70,6 +73,9 @@ static double ant_lon = 0.0;
 static double rov_lat = 0.0;
 static double rov_lon = 0.0;
 static bool rov_updated = false;
+static unsigned long last_rover_update = 0; // Staleness tracking
+static double last_recv_lat = 0.0; // For robust duplicate detection
+static double last_recv_lon = 0.0;
 
 // Compass state — I2C failure recovery
 static double last_valid_heading = 0.0;
@@ -95,9 +101,7 @@ static void send_motor_pulse(int microseconds) {
   digitalWrite(MOTOR1_PIN, LOW);
 }
 
-void stop_motor() {
-  send_motor_pulse(MOTOR_PULSE_STOP);
-}
+void stop_motor() { send_motor_pulse(MOTOR_PULSE_STOP); }
 
 void rotate_motor_right(int speed) {
   speed = constrain(speed, 0, 100);
@@ -142,6 +146,15 @@ static void parse_telemetry_line(const String &line) {
 
   if (lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0 &&
       (lat != 0.0 || lon != 0.0)) {
+    // Only refresh staleness timer when coordinate actually CHANGES.
+    // Use last_recv_lat to check for changes so it doesn't false-trigger
+    // if rov_lat was zeroed out by the timeout.
+    if (fabs(lat - last_recv_lat) > 0.0000001 || fabs(lon - last_recv_lon) > 0.0000001) {
+      last_rover_update = millis();
+    }
+    last_recv_lat = lat;
+    last_recv_lon = lon;
+    
     rov_lat = lat;
     rov_lon = lon;
     rov_updated = true;
@@ -231,6 +244,13 @@ void get_rover_coordinates(double *lat, double *lon) {
         telemBuf = "";
       }
     }
+  }
+
+  // Staleness check: if no new telemetry for 5 seconds, clear rover position.
+  // This stops the motor when the bridge/rover stops sending data.
+  if (last_rover_update > 0 && (millis() - last_rover_update >= TELEM_STALE_MS)) {
+    rov_lat = 0.0;
+    rov_lon = 0.0;
   }
 
   *lat = rov_lat;

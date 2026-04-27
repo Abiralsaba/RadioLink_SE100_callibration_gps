@@ -82,6 +82,13 @@ static double last_valid_heading = 0.0;
 static unsigned long last_compass_warn = 0;
 static bool _compass_healthy = false;
 
+// Compass heading filter — circular EMA to eliminate jitter
+// Raw heading is kept in last_valid_heading for position tracking.
+// Filtered heading is returned to the control loop for smooth control.
+static double filtered_heading = 0.0;
+static bool heading_filter_init = false;
+#define HEADING_ALPHA 0.4 // 0.0 = no update, 1.0 = no filtering
+
 // Motor position tracking (wire-tangle prevention)
 // Virtual position: boots at 180°, range [0°, 360°]
 // Tracked by accumulating compass heading deltas
@@ -295,16 +302,30 @@ double get_antenna_heading() {
     last_valid_heading = (double)(headingRadians * 180.0f / PI);
     _compass_healthy = true;
 
+    // Apply circular EMA filter for smooth control output.
+    // Uses angular difference to avoid discontinuity at 0°/360°.
+    if (!heading_filter_init) {
+      filtered_heading = last_valid_heading;
+      heading_filter_init = true;
+    } else {
+      double diff = last_valid_heading - filtered_heading;
+      if (diff > 180.0) diff -= 360.0;
+      if (diff < -180.0) diff += 360.0;
+      filtered_heading += HEADING_ALPHA * diff;
+      if (filtered_heading < 0.0) filtered_heading += 360.0;
+      if (filtered_heading >= 360.0) filtered_heading -= 360.0;
+    }
+
   } else {
     _compass_healthy = false;
     if (millis() - last_compass_warn >= 2000) {
       last_compass_warn = millis();
       Serial.printf("[COMPASS] I2C read failed — holding last heading: %.1f°\n",
-                    last_valid_heading);
+                    filtered_heading);
     }
   }
 
-  return last_valid_heading;
+  return filtered_heading;
 }
 
 bool is_compass_healthy() { return _compass_healthy; }

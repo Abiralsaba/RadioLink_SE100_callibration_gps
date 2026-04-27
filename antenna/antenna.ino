@@ -1,13 +1,35 @@
 #include "hardware_interface.h"
 #include "tracking_math.h"
 
-// Tracking threshold — stop motor when heading is within this of target
-#define HEADING_THRESHOLD 3.0
+// ═══════════════════════════════════════════════════════
+//  CONTROL PARAMETERS
+//  Tuned for slow, smooth, pinpoint tracking.
+// ═══════════════════════════════════════════════════════
 
-// Motor position safety margins (don't allow closer than 2° to limits)
+// Hysteresis deadband — prevents motor chattering near target.
+// Motor stops when error drops below ALIGN_THRESHOLD.
+// Motor restarts only when error exceeds MOVE_THRESHOLD.
+#define ALIGN_THRESHOLD 2.0 // degrees — precision stop
+#define MOVE_THRESHOLD 5.0  // degrees — restart margin
+
+// Motor speed limits (0–100 scale → Sabertooth pulse width)
+#define MIN_MOTOR_SPEED 5  // Minimum that overcomes motor stiction
+#define MAX_MOTOR_SPEED 12 // Capped low for smooth, controlled movement
+
+// Proportional gain: maps heading error (degrees) → motor speed.
+// At 40° error: speed = 0.25 * 40 = 10 → near max.
+// At 10° error: speed = 0.25 * 10 = 2.5 → clamped to MIN (5).
+#define KP 0.25
+
+// Motor position safety margins (wire-tangle prevention)
 #define POS_LIMIT_MARGIN 2.0
 
+// ═══════════════════════════════════════════════════════
+//  CONTROL STATE
+// ═══════════════════════════════════════════════════════
 static unsigned long lastPrint = 0;
+static double prev_error = 0.0;
+static bool aligned = true; // True = antenna is on target, motor idle
 
 void setup() {
   Serial.begin(115200);
@@ -19,21 +41,20 @@ void loop() {
   double my_lat, my_lon;
   double rover_lat, rover_lon;
 
-  // 1. Read inputs (ALWAYS — keeps serial buffers drained and caches updated)
+  // ── 1. READ ALL INPUTS (non-blocking, drains serial buffers) ──
   get_antenna_coordinates(&my_lat, &my_lon);
   get_rover_coordinates(&rover_lat, &rover_lon);
 
-  double heading = get_antenna_heading();
+  double heading = get_antenna_heading(); // Filtered (EMA) heading
 
-  // 2. Update motor position tracking (compass delta accumulation)
+  // ── 2. UPDATE MOTOR POSITION (compass delta accumulation) ──
   update_motor_position();
   double motor_pos = get_motor_position();
 
-  // 3. Safety: if compass fails, STOP motor immediately
-  //    Without compass feedback the motor would spin blindly.
+  // ── 3. SAFETY: compass failure → immediate stop ──
   if (!is_compass_healthy()) {
     stop_motor();
-    // Still print diagnostics, but skip all computation
+    aligned = true;
     if (millis() - lastPrint >= 1000) {
       lastPrint = millis();
       Serial.printf("[SAFETY] Compass failed — motor stopped | Pos: %.1f\n",
@@ -43,7 +64,7 @@ void loop() {
     return;
   }
 
-  // 4. Coordinate validity — don't track until both positions are valid
+  // ── 4. COORDINATE VALIDITY ──
   bool antenna_ready = (my_lat != 0.0 || my_lon != 0.0);
   bool rover_ready = (rover_lat != 0.0 || rover_lon != 0.0);
 
@@ -52,40 +73,56 @@ void loop() {
 
   if (antenna_ready && rover_ready) {
 
-    // 5. Compute navigation
+    // ── 5. NAVIGATION ──
     bearing = compute_bearing(my_lat, my_lon, rover_lat, rover_lon);
 
-    // 6. Compute heading error [-180, +180]
-    //    Positive = rover is clockwise from current heading
-    //    Negative = rover is counter-clockwise
+    // Heading error: positive = rover is CW from current heading
     error = compute_heading_error(bearing, heading);
 
-    // 7. Motor control with wire-tangle prevention
-    if (fabs(error) > HEADING_THRESHOLD) {
+    double abs_error = fabs(error);
 
-      // Determine natural direction
-      bool want_right = (error > 0); // positive error → go CW (right)
+    // ── 6. HYSTERESIS DEADBAND ──
+    // Prevents the motor from chattering when heading hovers near target.
+    // Once aligned, the motor stays stopped until error grows past MOVE_THRESHOLD.
+    if (aligned) {
+      if (abs_error > MOVE_THRESHOLD) {
+        aligned = false; // Error has grown — begin tracking
+      }
+    } else {
+      if (abs_error <= ALIGN_THRESHOLD) {
+        aligned = true; // Reached target — lock on
+      }
+    }
 
-      // Wire-tangle check: prevent crossing 0°/360° boundary
-      if (want_right && motor_pos >= (360.0 - POS_LIMIT_MARGIN)) {
-        // At right limit — MUST go left (long way back)
-        want_right = false;
-      } else if (!want_right && motor_pos <= POS_LIMIT_MARGIN) {
-        // At left limit — MUST go right (long way back)
-        want_right = true;
+    if (!aligned) {
+      // ── 7. PROPORTIONAL SPEED CONTROLLER ──
+      // Continuous linear mapping from error to speed.
+      // Approach braking: when error is small and decreasing,
+      // force minimum speed to prevent overshoot from motor inertia.
+      int speed;
+
+      bool approaching =
+          (abs_error < fabs(prev_error)); // Error is getting smaller
+
+      if (abs_error < 10.0 && approaching) {
+        // Close to target AND closing in — crawl to prevent overshoot
+        speed = MIN_MOTOR_SPEED;
+      } else {
+        // Standard proportional response
+        speed = (int)(KP * abs_error);
+        speed = constrain(speed, MIN_MOTOR_SPEED, MAX_MOTOR_SPEED);
       }
 
-      // Proportional speed based on error magnitude
-      int speed;
-      double abs_error = fabs(error);
-      if (abs_error > 30.0)
-        speed = 40; // Fast approach
-      else if (abs_error > 10.0)
-        speed = 20; // Medium
-      else
-        speed = 10; // Slow, precise
+      // ── 8. DIRECTION WITH WIRE-TANGLE PREVENTION ──
+      bool want_right = (error > 0); // Positive error → rotate CW
 
-      // Drive motor
+      if (want_right && motor_pos >= (360.0 - POS_LIMIT_MARGIN)) {
+        want_right = false; // At right limit → take long way left
+      } else if (!want_right && motor_pos <= POS_LIMIT_MARGIN) {
+        want_right = true; // At left limit → take long way right
+      }
+
+      // ── 9. DRIVE MOTOR ──
       if (want_right) {
         rotate_motor_right(speed);
       } else {
@@ -93,16 +130,20 @@ void loop() {
       }
 
     } else {
-      // Within threshold — aligned with rover, stop
+      // Aligned — hold position
       stop_motor();
     }
 
+    prev_error = error;
+
   } else {
-    // No valid coordinates — stop motor, wait for GPS/telemetry
+    // No valid coordinates — stop motor, wait for data
     stop_motor();
+    aligned = true;
+    prev_error = 0.0;
   }
 
-  // 8. Serial monitor — print once per second
+  // ── 10. SERIAL DIAGNOSTICS (1 Hz) ──
   if (millis() - lastPrint >= 1000) {
     lastPrint = millis();
 
@@ -110,24 +151,25 @@ void loop() {
     if (antenna_ready) {
       Serial.printf("%.7f,%.7f", my_lat, my_lon);
     } else {
-      Serial.print("Waiting for GPS");
+      Serial.print("Waiting GPS");
     }
 
     Serial.print(" | Rover: ");
     if (rover_ready) {
       Serial.printf("%.7f,%.7f", rover_lat, rover_lon);
     } else {
-      Serial.print("Waiting for Telemetry");
+      Serial.print("Waiting Telem");
     }
 
     Serial.printf(" | H: %.1f | Pos: %.1f", heading, motor_pos);
 
     if (antenna_ready && rover_ready) {
-      Serial.printf(" | B: %.1f | Err: %.1f", bearing, error);
+      Serial.printf(" | B: %.1f | Err: %.1f | %s", bearing, error,
+                    aligned ? "ALIGNED" : "TRACKING");
     }
 
     Serial.println();
   }
 
-  delay(20); // ~50 Hz — required for continuous Sabertooth pulse updates
+  delay(20); // ~50 Hz — continuous Sabertooth pulse cadence
 }

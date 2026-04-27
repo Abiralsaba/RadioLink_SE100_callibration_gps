@@ -13,7 +13,7 @@
 #define MOVE_THRESHOLD 5.0  // degrees — restart margin
 
 // Motor speed limits (0–100 scale → Sabertooth pulse width)
-#define MIN_MOTOR_SPEED 5  // Minimum that overcomes motor stiction
+#define MIN_MOTOR_SPEED 7  // Minimum that reliably overcomes motor stiction
 #define MAX_MOTOR_SPEED 12 // Capped low for smooth, controlled movement
 
 // Proportional gain: maps heading error (degrees) → motor speed.
@@ -22,7 +22,8 @@
 #define KP 0.25
 
 // Motor position safety margins (wire-tangle prevention)
-#define POS_LIMIT_MARGIN 2.0
+// Must be wider than compass noise (~2-3°) to prevent direction-flip oscillation.
+#define POS_LIMIT_MARGIN 5.0
 
 // ═══════════════════════════════════════════════════════
 //  CONTROL STATE

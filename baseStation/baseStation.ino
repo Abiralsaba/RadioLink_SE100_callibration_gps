@@ -5,7 +5,7 @@
 //  (send_rover_coordinate.py) via USB Serial at 115200.
 //
 //  Forwards them via telemetry to Side 1 (servo side)
-//  using Serial2 at 9600 baud.
+//  using Serial2 at 57600 baud.
 //
 //  Bridge format:  "lat:<value>,lon:<value>\n"
 //  Relay format:   "lat:<value>,lon:<value>\n"  (same)
@@ -17,7 +17,7 @@
 
 #include <HardwareSerial.h>
 
-// Telemetry — Serial2, RX=16, TX=17, 9600 baud
+// Telemetry — Serial2, RX=16, TX=17, 57600 baud
 #define TELEM_RX_PIN 16
 #define TELEM_TX_PIN 17
 #define TELEM_BAUD 57600
@@ -39,7 +39,7 @@ void setup() {
   // USB Serial — receives data from Python bridge at 115200
   Serial.begin(115200);
 
-  // Telemetry Serial — sends data to Side 1 at 9600
+  // Telemetry Serial — sends data to Side 1 at 57600
   telemSerial.begin(TELEM_BAUD, SERIAL_8N1, TELEM_RX_PIN, TELEM_TX_PIN);
 
   delay(1000);

@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "C/C++ Runner: Debug Session",
+      "type": "lldb",
+      "request": "launch",
+      "args": [],
+      "cwd": "/Users/mdabiralsaba/Documents/Arduino/RoverTrackingAntenna/antenna",
+      "program": "/Users/mdabiralsaba/Documents/Arduino/RoverTrackingAntenna/antenna/build/Debug/outDebug"
+    }
+  ]
+}

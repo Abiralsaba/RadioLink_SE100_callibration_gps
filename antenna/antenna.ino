@@ -1,7 +1,12 @@
 #include "hardware_interface.h"
 #include "tracking_math.h"
 
-double prev_error = 0;
+// Tracking threshold — stop motor when heading is within this of target
+#define HEADING_THRESHOLD 3.0
+
+// Motor position safety margins (don't allow closer than 2° to limits)
+#define POS_LIMIT_MARGIN 2.0
+
 static unsigned long lastPrint = 0;
 
 void setup() {
@@ -20,50 +25,87 @@ void loop() {
 
   double heading = get_antenna_heading();
 
-  // 2. Coordinate validity — do NOT compute or drive servo on (0,0)
-  //    GPS returns (0,0) before satellite lock (~30-60s after boot).
-  //    Telemetry returns (0,0) before the rover sends its first position.
-  //    Computing bearing on (0,0)→(0,0) produces garbage that slams the servo.
-  //    Servo holds its current position (90° after init sweep) until both acquire.
+  // 2. Update motor position tracking (compass delta accumulation)
+  update_motor_position();
+  double motor_pos = get_motor_position();
+
+  // 3. Safety: if compass fails, STOP motor immediately
+  //    Without compass feedback the motor would spin blindly.
+  if (!is_compass_healthy()) {
+    stop_motor();
+    // Still print diagnostics, but skip all computation
+    if (millis() - lastPrint >= 1000) {
+      lastPrint = millis();
+      Serial.printf("[SAFETY] Compass failed — motor stopped | Pos: %.1f\n",
+                    motor_pos);
+    }
+    delay(20);
+    return;
+  }
+
+  // 4. Coordinate validity — don't track until both positions are valid
   bool antenna_ready = (my_lat != 0.0 || my_lon != 0.0);
   bool rover_ready = (rover_lat != 0.0 || rover_lon != 0.0);
 
   double bearing = 0.0;
   double error = 0.0;
-  double servo_angle = 90.0;
 
   if (antenna_ready && rover_ready) {
 
-    // 3. Compute navigation
+    // 5. Compute navigation
     bearing = compute_bearing(my_lat, my_lon, rover_lat, rover_lon);
-    double distance = compute_distance(my_lat, my_lon, rover_lat, rover_lon);
 
-    // 4. Compute error
+    // 6. Compute heading error [-180, +180]
+    //    Positive = rover is clockwise from current heading
+    //    Negative = rover is counter-clockwise
     error = compute_heading_error(bearing, heading);
 
-    // 5. Stability
-    double deadband = compute_dynamic_deadband(distance);
-    error = apply_deadband(error, deadband);
-    error = low_pass_filter(error, prev_error, 0.2);
+    // 7. Motor control with wire-tangle prevention
+    if (fabs(error) > HEADING_THRESHOLD) {
 
-    // 6. Servo output
-    servo_angle = 90.0 + error;
+      // Determine natural direction
+      bool want_right = (error > 0); // positive error → go CW (right)
 
-    if (servo_angle < 0)
-      servo_angle = 0;
-    if (servo_angle > 180)
-      servo_angle = 180;
+      // Wire-tangle check: prevent crossing 0°/360° boundary
+      if (want_right && motor_pos >= (360.0 - POS_LIMIT_MARGIN)) {
+        // At right limit — MUST go left (long way back)
+        want_right = false;
+      } else if (!want_right && motor_pos <= POS_LIMIT_MARGIN) {
+        // At left limit — MUST go right (long way back)
+        want_right = true;
+      }
 
-    set_servo_angle(servo_angle);
+      // Proportional speed based on error magnitude
+      int speed;
+      double abs_error = fabs(error);
+      if (abs_error > 30.0)
+        speed = 40; // Fast approach
+      else if (abs_error > 10.0)
+        speed = 20; // Medium
+      else
+        speed = 10; // Slow, precise
 
-    prev_error = error;
+      // Drive motor
+      if (want_right) {
+        rotate_motor_right(speed);
+      } else {
+        rotate_motor_left(speed);
+      }
+
+    } else {
+      // Within threshold — aligned with rover, stop
+      stop_motor();
+    }
+
+  } else {
+    // No valid coordinates — stop motor, wait for GPS/telemetry
+    stop_motor();
   }
 
-  // 7. Serial monitor — print once per second
+  // 8. Serial monitor — print once per second
   if (millis() - lastPrint >= 1000) {
     lastPrint = millis();
 
-    // Own GPS
     Serial.print("Base: ");
     if (antenna_ready) {
       Serial.printf("%.7f,%.7f", my_lat, my_lon);
@@ -71,7 +113,6 @@ void loop() {
       Serial.print("Waiting for GPS");
     }
 
-    // Received rover telemetry
     Serial.print(" | Rover: ");
     if (rover_ready) {
       Serial.printf("%.7f,%.7f", rover_lat, rover_lon);
@@ -79,17 +120,14 @@ void loop() {
       Serial.print("Waiting for Telemetry");
     }
 
-    // Compass heading
-    Serial.printf(" | H: %.1f", heading);
+    Serial.printf(" | H: %.1f | Pos: %.1f", heading, motor_pos);
 
-    // Bearing & error (only when both positions are valid)
     if (antenna_ready && rover_ready) {
-      Serial.printf(" | B: %.1f | Err: %.1f | Servo: %.1f", bearing, error,
-                    servo_angle);
+      Serial.printf(" | B: %.1f | Err: %.1f", bearing, error);
     }
 
     Serial.println();
   }
 
-  delay(100); // ~10 Hz
+  delay(20); // ~50 Hz — required for continuous Sabertooth pulse updates
 }

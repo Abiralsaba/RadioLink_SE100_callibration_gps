@@ -13,7 +13,7 @@
 #define MOVE_THRESHOLD 5.0  // degrees — restart margin
 
 // Motor speed limits (0–100 scale → Sabertooth pulse width)
-#define MIN_MOTOR_SPEED 5  // Minimum that overcomes motor stiction
+#define MIN_MOTOR_SPEED 6  // Minimum that reliably overcomes motor stiction
 #define MAX_MOTOR_SPEED 8  // Capped very low for slow, smooth tracking
 
 // Proportional gain: maps heading error (degrees) → motor speed.
@@ -35,8 +35,14 @@
 // ═══════════════════════════════════════════════════════
 static unsigned long lastPrint = 0;
 static double prev_error = 0.0;
-static bool aligned = true; // True = antenna is on target, motor idle
-static int current_speed = 0; // Ramped motor speed (smoothed)
+static bool aligned = true;    // True = antenna is on target, motor idle
+static int current_speed = 0;  // Ramped motor speed (smoothed)
+
+// Wire-tangle committed direction (hysteresis).
+// Once the motor enters a limit zone, it COMMITS to the reverse direction
+// and doesn't release until motor_pos is well clear of the limit.
+static bool wire_forced_left = false;  // Committed to LEFT (hit right limit)
+static bool wire_forced_right = false; // Committed to RIGHT (hit left limit)
 
 void setup() {
   Serial.begin(115200);
@@ -93,7 +99,7 @@ void loop() {
     // If rover is very close, GPS noise dominates bearing → stop tracking.
     double distance =
         compute_distance(my_lat, my_lon, rover_lat, rover_lon);
-    if (distance < 30.0) {
+    if (distance < 5.0) {
       stop_motor();
       aligned = true;
       current_speed = 0;
@@ -142,13 +148,33 @@ void loop() {
       }
       current_speed = constrain(current_speed, MIN_MOTOR_SPEED, MAX_MOTOR_SPEED);
 
-      // ── 8. DIRECTION WITH WIRE-TANGLE PREVENTION ──
+      // ── 8. DIRECTION WITH WIRE-TANGLE PREVENTION (hysteresis) ──
+      // Committed reversal: once the motor enters a limit zone, it stays
+      // in the forced direction until well clear. This prevents oscillation
+      // at the boundary.
       bool want_right = (error > 0); // Positive error → rotate CW
 
-      if (want_right && motor_pos >= (360.0 - POS_LIMIT_MARGIN)) {
-        want_right = false; // At right limit → take long way left
-      } else if (!want_right && motor_pos <= POS_LIMIT_MARGIN) {
-        want_right = true; // At left limit → take long way right
+      // Enter forced zone at limits
+      if (motor_pos >= (360.0 - POS_LIMIT_MARGIN)) {
+        wire_forced_left = true;  // Hit right limit → commit LEFT
+      }
+      if (motor_pos <= POS_LIMIT_MARGIN) {
+        wire_forced_right = true; // Hit left limit → commit RIGHT
+      }
+
+      // Release forced zone only when well clear (3× margin)
+      if (wire_forced_left && motor_pos <= (360.0 - 3.0 * POS_LIMIT_MARGIN)) {
+        wire_forced_left = false;
+      }
+      if (wire_forced_right && motor_pos >= (3.0 * POS_LIMIT_MARGIN)) {
+        wire_forced_right = false;
+      }
+
+      // Apply committed direction
+      if (wire_forced_left) {
+        want_right = false;
+      } else if (wire_forced_right) {
+        want_right = true;
       }
 
       // ── 9. DRIVE MOTOR ──

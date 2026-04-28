@@ -13,17 +13,22 @@
 #define MOVE_THRESHOLD 5.0  // degrees — restart margin
 
 // Motor speed limits (0–100 scale → Sabertooth pulse width)
-#define MIN_MOTOR_SPEED 7  // Minimum that reliably overcomes motor stiction
-#define MAX_MOTOR_SPEED 12 // Capped low for smooth, controlled movement
+#define MIN_MOTOR_SPEED 5  // Minimum that overcomes motor stiction
+#define MAX_MOTOR_SPEED 8  // Capped very low for slow, smooth tracking
 
 // Proportional gain: maps heading error (degrees) → motor speed.
-// At 40° error: speed = 0.25 * 40 = 10 → near max.
-// At 10° error: speed = 0.25 * 10 = 2.5 → clamped to MIN (5).
-#define KP 0.25
+// At 40° error: speed = 0.15 * 40 = 6 → moderate.
+// At 10° error: speed = 0.15 * 10 = 1.5 → clamped to MIN (5).
+#define KP 0.15
 
 // Motor position safety margins (wire-tangle prevention)
-// Must be wider than compass noise (~2-3°) to prevent direction-flip oscillation.
+// Must be wider than compass noise (~2-3°) to prevent direction-flip
+// oscillation.
 #define POS_LIMIT_MARGIN 5.0
+
+// Speed ramp rate — max speed change per loop iteration (~50Hz).
+// Prevents abrupt motor speed transitions for smooth operation.
+#define SPEED_RAMP_STEP 1
 
 // ═══════════════════════════════════════════════════════
 //  CONTROL STATE
@@ -31,6 +36,7 @@
 static unsigned long lastPrint = 0;
 static double prev_error = 0.0;
 static bool aligned = true; // True = antenna is on target, motor idle
+static int current_speed = 0; // Ramped motor speed (smoothed)
 
 void setup() {
   Serial.begin(115200);
@@ -56,6 +62,7 @@ void loop() {
   if (!is_compass_healthy()) {
     stop_motor();
     aligned = true;
+    current_speed = 0;
     if (millis() - lastPrint >= 1000) {
       lastPrint = millis();
       Serial.printf("[SAFETY] Compass failed — motor stopped | Pos: %.1f\n",
@@ -82,37 +89,58 @@ void loop() {
 
     double abs_error = fabs(error);
 
+    // ── 5b. MINIMUM DISTANCE GUARD ──
+    // If rover is very close, GPS noise dominates bearing → stop tracking.
+    double distance =
+        compute_distance(my_lat, my_lon, rover_lat, rover_lon);
+    if (distance < 30.0) {
+      stop_motor();
+      aligned = true;
+      current_speed = 0;
+      prev_error = error;
+      if (millis() - lastPrint >= 1000) {
+        lastPrint = millis();
+        Serial.printf("Base: %.7f,%.7f | Rover: %.7f,%.7f | Dist: %.0fm | "
+                      "TOO CLOSE — holding\n",
+                      my_lat, my_lon, rover_lat, rover_lon, distance);
+      }
+      delay(20);
+      return;
+    }
+
     // ── 6. HYSTERESIS DEADBAND ──
-    // Prevents the motor from chattering when heading hovers near target.
-    // Once aligned, the motor stays stopped until error grows past MOVE_THRESHOLD.
     if (aligned) {
       if (abs_error > MOVE_THRESHOLD) {
-        aligned = false; // Error has grown — begin tracking
+        aligned = false;
       }
     } else {
       if (abs_error <= ALIGN_THRESHOLD) {
-        aligned = true; // Reached target — lock on
+        aligned = true;
       }
     }
 
     if (!aligned) {
       // ── 7. PROPORTIONAL SPEED CONTROLLER ──
-      // Continuous linear mapping from error to speed.
-      // Approach braking: when error is small and decreasing,
-      // force minimum speed to prevent overshoot from motor inertia.
-      int speed;
+      int target_speed;
 
-      bool approaching =
-          (abs_error < fabs(prev_error)); // Error is getting smaller
+      bool approaching = (abs_error < fabs(prev_error));
 
       if (abs_error < 10.0 && approaching) {
-        // Close to target AND closing in — crawl to prevent overshoot
-        speed = MIN_MOTOR_SPEED;
+        target_speed = MIN_MOTOR_SPEED; // Crawl near target
       } else {
-        // Standard proportional response
-        speed = (int)(KP * abs_error);
-        speed = constrain(speed, MIN_MOTOR_SPEED, MAX_MOTOR_SPEED);
+        target_speed = (int)(KP * abs_error);
+        target_speed = constrain(target_speed, MIN_MOTOR_SPEED, MAX_MOTOR_SPEED);
       }
+
+      // ── 7b. SPEED RAMP LIMITER ──
+      // Smoothly ramp current_speed toward target_speed.
+      // Max change = SPEED_RAMP_STEP per loop (~50Hz).
+      if (current_speed < target_speed) {
+        current_speed = min(current_speed + SPEED_RAMP_STEP, target_speed);
+      } else if (current_speed > target_speed) {
+        current_speed = max(current_speed - SPEED_RAMP_STEP, target_speed);
+      }
+      current_speed = constrain(current_speed, MIN_MOTOR_SPEED, MAX_MOTOR_SPEED);
 
       // ── 8. DIRECTION WITH WIRE-TANGLE PREVENTION ──
       bool want_right = (error > 0); // Positive error → rotate CW
@@ -125,14 +153,15 @@ void loop() {
 
       // ── 9. DRIVE MOTOR ──
       if (want_right) {
-        rotate_motor_right(speed);
+        rotate_motor_right(current_speed);
       } else {
-        rotate_motor_left(speed);
+        rotate_motor_left(current_speed);
       }
 
     } else {
       // Aligned — hold position
       stop_motor();
+      current_speed = 0;
     }
 
     prev_error = error;
@@ -141,6 +170,7 @@ void loop() {
     // No valid coordinates — stop motor, wait for data
     stop_motor();
     aligned = true;
+    current_speed = 0;
     prev_error = 0.0;
   }
 
